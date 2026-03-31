@@ -2,12 +2,6 @@
 
 A real-time, browser-based generative art engine that simulates and visualizes complex strange attractors. [cite_start]This project combines mathematical precision with high-performance rendering techniques to create hypnotic, interactive point-cloud animations[cite: 2].
 
----
-<video width="100%" controls autoplay loop muted poster="preview.png">
-  <source src="assets/demo.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
-
 --
 ## 🚀 Overview
 [cite_start]The **Attractor Engine** is designed to handle tens of thousands of particles moving through non-linear dynamical systems[cite: 2]. It features seamless "morphing" between different mathematical recipes, interactive mouse-driven spatial deformation, and a post-processing pipeline for RGB splitting effects.
