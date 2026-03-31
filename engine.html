@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Attractor Engine</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; cursor: none; }
+canvas { display: block; }
+#hud { position: fixed; top: 12px; left: 16px; color: rgba(255,255,255,0.4); font: 11px monospace; pointer-events: none; z-index: 10; line-height: 1.7; }
+#flash { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(255,255,255,0.06); pointer-events: none; opacity: 0; transition: opacity 0.4s; z-index: 5; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<div id="hud"></div>
+<div id="flash"></div>
+<script src="attractors.js"></script>
+<script>
+// ============================================================
+//  Engine — Particles + morph + RGB post + mouse deformation
+//
+//  Performance optimizations:
+//  1. Uint32 decay pass (4 channels as one 32-bit int)
+//  2. Tile-based dirty decay (64px tiles, skip black regions)
+//  3. Adaptive noise budget (fps-driven cache interval)
+//  4. Morph particle tiers (low-priority = fewer sub-steps)
+//  5. Sub-step reduction (5 -> 3)
+//  6. WebWorker — deferred (requires COOP/COEP headers for
+//     SharedArrayBuffer; local file:// can't provide these)
+//  7. Cheaper RGB split (hash2d normals instead of 3x simplex3)
+// ============================================================
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+const hudEl = document.getElementById('hud');
+const flashEl = document.getElementById('flash');
+
+const W = 1920, H = 1080;
+const PIXELS = W * H;
+canvas.style.width = '100vw';
+canvas.style.height = '100vh';
+
+let imgData = ctx.createImageData(W, H);
+let pix = imgData.data;
+const pix32 = new Uint32Array(pix.buffer);           // [opt 1] Uint32 view
+let prevPix = new Uint8Array(PIXELS * 4);
+const prevPix32 = new Uint32Array(prevPix.buffer);    // [opt 1] Uint32 view
+
+// --- [opt 2] Tile-based dirty decay ---
+const TILE_SHIFT = 6; // 64px tiles
+const TILES_X = ((W - 1) >> TILE_SHIFT) + 1; // 30
+const TILES_Y = ((H - 1) >> TILE_SHIFT) + 1; // 17
+const tileLife = new Uint8Array(TILES_X * TILES_Y);
+const TILE_PERSIST = 45; // frames to keep decaying after last particle
+
+// --- Particle arrays ---
+const MAX_P = 45000;
+const ppx = new Float32Array(MAX_P);
+const ppy = new Float32Array(MAX_P);
+const ppz = new Float32Array(MAX_P);
+const life = new Float32Array(MAX_P);
+const maxLife = new Float32Array(MAX_P);
+const noiseCache = new Float32Array(MAX_P);
+const noiseTick = new Uint8Array(MAX_P);
+
+// --- Mouse state ---
+let mouseX = W / 2, mouseY = H / 2;
+let mousePrevX = W / 2, mousePrevY = H / 2;
+let mouseVel = 0;
+let mouseActive = false;
+let mouseInfluence = 0;
+let mouse3X = 0, mouse3Y = 0, mouse3Z = 0;
+
+let cssToCanvasX = 1, cssToCanvasY = 1;
+
+function updateCanvasScale() {
+    const rect = canvas.getBoundingClientRect();
+    cssToCanvasX = W / rect.width;
+    cssToCanvasY = H / rect.height;
+}
+updateCanvasScale();
+window.addEventListener('resize', updateCanvasScale);
+
+canvas.addEventListener('mousemove', (e) => {
+    mouseX = e.clientX * cssToCanvasX;
+    mouseY = e.clientY * cssToCanvasY;
+    mouseActive = true;
+});
+canvas.addEventListener('mouseleave', () => { mouseActive = false; });
+canvas.addEventListener('mouseenter', () => { mouseActive = true; randomizeMouseDeform(); });
+
+// --- Morph state ---
+let recipeA = null, recipeB = null;
+let morphT = 1;
+const MORPH_DURATION = 3.0;
+let morphing = false;
+
+let activeScale = 0, activeDt = 0, activeCam = 0;
+let activePalette = null;
+let activeDecay = 0;
+
+let NUM = 0;
+let time = 0, lastFrame = 0;
+let fpsFrames = 0, fpsTime = 0, fpsDisplay = 0;
+
+// --- [opt 3] Adaptive noise budget ---
+let noiseCacheInterval = 4;
+let adaptiveFps = 60;
+
+const _dA = new Float64Array(3);
+const _dB = new Float64Array(3);
+
+// --- [opt 7] Cheap 2D hash for RGB split normals ---
+function hash2d(x, y) {
+    let h = ((x * 374761393 + y * 668265263) | 0) ^ 1013904223;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) & 0xFFFF) / 32768 - 1;
+}
+
+function spawnParticle(i, recipe) {
+    recipe.attractor.def.spawn();
+    ppx[i] = _out[0]; ppy[i] = _out[1]; ppz[i] = _out[2];
+    life[i] = 0;
+    maxLife[i] = recipe.lifeRange[0] + Math.random() * (recipe.lifeRange[1] - recipe.lifeRange[0]);
+    noiseCache[i] = 0.5;
+    noiseTick[i] = (Math.random() * noiseCacheInterval) | 0;
+}
+
+function preRun(recipe, seconds) {
+    const fn = recipe.attractor.def.fn;
+    const params = recipe.attractor.params;
+    const dt = recipe.attractor.def.dt;
+    const stepsPerSec = 1 / dt / 3; // [opt 5] matches BASE_STEPS=3
+    const totalSteps = (stepsPerSec * seconds) | 0;
+    for (let i = 0; i < NUM; i++) {
+        const steps = Math.min(totalSteps, ((Math.random() * totalSteps) | 0) + totalSteps / 2);
+        for (let s = 0; s < steps; s++) {
+            fn(ppx[i], ppy[i], ppz[i], params);
+            ppx[i] += _out[0] * dt; ppy[i] += _out[1] * dt; ppz[i] += _out[2] * dt;
+            if (ppx[i] !== ppx[i] || Math.abs(ppx[i]) > 200) {
+                recipe.attractor.def.spawn();
+                ppx[i] = _out[0]; ppy[i] = _out[1]; ppz[i] = _out[2];
+            }
+        }
+        life[i] = Math.random() * maxLife[i];
+    }
+}
+
+function initFirstRecipe() {
+    recipeB = generateRecipe();
+    recipeA = recipeB;
+    NUM = recipeB.particles;
+    morphT = 1; morphing = false;
+    updateBlendedParams();
+    for (let i = 0; i < NUM; i++) spawnParticle(i, recipeB);
+    prevPix.fill(0);
+    tileLife.fill(TILE_PERSIST); // [opt 2] all tiles dirty for first frame
+    preRun(recipeB, 4);
+}
+
+function startMorph() {
+    recipeA = recipeB;
+    recipeB = generateRecipe(recipeA.attractor.key);
+    const newNum = recipeB.particles;
+    if (newNum > NUM) for (let i = NUM; i < newNum; i++) spawnParticle(i, recipeB);
+    NUM = Math.max(NUM, newNum);
+    morphT = 0; morphing = true;
+    flashEl.style.opacity = '1';
+    setTimeout(() => flashEl.style.opacity = '0', 50);
+}
+
+function updateBlendedParams() {
+    const t = morphT;
+    const defA = recipeA.attractor.def, defB = recipeB.attractor.def;
+    activeScale = Math.min(W, H) * (defA.scale + (defB.scale - defA.scale) * t);
+    activeDt = defA.dt + (defB.dt - defA.dt) * t;
+    activeCam = defA.cam + (defB.cam - defA.cam) * t;
+    activeDecay = recipeA.trailDecay + (recipeB.trailDecay - recipeA.trailDecay) * t;
+    activePalette = morphing ? lerpPalette(recipeA.palette, recipeB.palette, t) : recipeB.palette;
+}
+
+document.addEventListener('click', startMorph);
+
+function splatFast(fx, fy, r, g, b) {
+    const ix = (fx + 0.5) | 0, iy = (fy + 0.5) | 0;
+    if (ix < 0 || ix >= W || iy < 0 || iy >= H) return;
+    const idx = (iy * W + ix) << 2;
+    pix[idx] += r; pix[idx+1] += g; pix[idx+2] += b;
+    tileLife[(iy >> TILE_SHIFT) * TILES_X + (ix >> TILE_SHIFT)] = TILE_PERSIST; // [opt 2]
+}
+
+function splatSub(fx, fy, r, g, b) {
+    const ix = fx | 0, iy = fy | 0;
+    if (ix < 1 || ix >= W - 2 || iy < 1 || iy >= H - 2) return;
+    const fracX = fx - ix, fracY = fy - iy;
+    const w00 = (1-fracX)*(1-fracY), w10 = fracX*(1-fracY);
+    const w01 = (1-fracX)*fracY, w11 = fracX*fracY;
+    let idx = (iy * W + ix) << 2;
+    pix[idx]+=r*w00; pix[idx+1]+=g*w00; pix[idx+2]+=b*w00;
+    idx+=4;
+    pix[idx]+=r*w10; pix[idx+1]+=g*w10; pix[idx+2]+=b*w10;
+    idx=((iy+1)*W+ix)<<2;
+    pix[idx]+=r*w01; pix[idx+1]+=g*w01; pix[idx+2]+=b*w01;
+    idx+=4;
+    pix[idx]+=r*w11; pix[idx+1]+=g*w11; pix[idx+2]+=b*w11;
+    tileLife[(iy >> TILE_SHIFT) * TILES_X + (ix >> TILE_SHIFT)] = TILE_PERSIST; // [opt 2]
+}
+
+function screenTo3D(sx, sy, ccY, scY, ccX, scX, screenScale) {
+    const rx1 = (sx - W * 0.5) / screenScale;
+    const ry1 = -(sy - H * 0.5) / screenScale;
+    const ry = ry1 * ccX;
+    const rz1 = ry1 * scX;
+    return [rx1 * ccY + rz1 * scY, ry, -rx1 * scY + rz1 * ccY];
+}
+
+function animate(now) {
+    const elapsed = Math.min((now - lastFrame) / 1000, 0.033);
+    lastFrame = now;
+    time += elapsed;
+
+    if (morphing) {
+        morphT = Math.min(1, morphT + elapsed / MORPH_DURATION);
+        if (morphT >= 1) { morphing = false; recipeA = recipeB; NUM = recipeB.particles; }
+        updateBlendedParams();
+    }
+
+    fpsFrames++;
+    fpsTime += elapsed;
+    if (fpsTime >= 1) {
+        fpsDisplay = Math.round(fpsFrames / fpsTime);
+        // [opt 3] Adaptive noise budget
+        adaptiveFps = adaptiveFps * 0.7 + fpsDisplay * 0.3;
+        if (adaptiveFps < 50) noiseCacheInterval = 8;
+        else if (adaptiveFps > 55) noiseCacheInterval = 4;
+        fpsFrames = 0; fpsTime = 0;
+    }
+
+    // --- Mouse velocity + influence ---
+    const rawVelX = (mouseX - mousePrevX) / Math.max(elapsed, 0.001);
+    const rawVelY = (mouseY - mousePrevY) / Math.max(elapsed, 0.001);
+    const rawSpeed = Math.sqrt(rawVelX * rawVelX + rawVelY * rawVelY);
+    mousePrevX = mouseX; mousePrevY = mouseY;
+    const velSmooth = rawSpeed > mouseVel ? 0.3 : 0.08;
+    mouseVel += (rawSpeed - mouseVel) * Math.min(1, elapsed / velSmooth);
+
+    const fadeTarget = mouseActive ? 1 : 0;
+    mouseInfluence += (fadeTarget - mouseInfluence) * Math.min(1, elapsed * 4);
+
+    const velNorm = Math.tanh(mouseVel / 600);
+
+    const screenScale = activeScale;
+    const cx = W >> 1, cy = H >> 1;
+    const camD = activeCam;
+
+    const camRotY = time * 0.08;
+    const camRotX = 0.35 + Math.sin(time * 0.05) * 0.2;
+    const ccY = Math.cos(camRotY), scY = Math.sin(camRotY);
+    const ccX = Math.cos(camRotX), scX = Math.sin(camRotX);
+
+    const doMouse = mouseInfluence > 0.01;
+    if (doMouse) {
+        const m3 = screenTo3D(mouseX, mouseY, ccY, scY, ccX, scX, screenScale);
+        mouse3X = m3[0]; mouse3Y = m3[1]; mouse3Z = m3[2];
+    }
+
+    const md = mouseDeform;
+    const mouseR = md.radius;
+    const mouseR2 = mouseR * mouseR;
+
+    // === [opt 1+2] Tile-based Uint32 decay ===
+    const decayI = (activeDecay * 256) | 0;
+    for (let ti = 0; ti < tileLife.length; ti++) {
+        if (tileLife[ti] === 0) continue;
+        tileLife[ti]--;
+        const tx = ti % TILES_X, ty = (ti / TILES_X) | 0;
+        const x0 = tx << TILE_SHIFT;
+        const y0 = ty << TILE_SHIFT;
+        const x1 = Math.min(x0 + (1 << TILE_SHIFT), W);
+        const y1 = Math.min(y0 + (1 << TILE_SHIFT), H);
+        for (let y = y0; y < y1; y++) {
+            const rowOff = y * W;
+            for (let x = x0; x < x1; x++) {
+                const j = rowOff + x;
+                const px = prevPix32[j];
+                const r = ((px & 0xFF) * decayI) >> 8;
+                const g = (((px >> 8) & 0xFF) * decayI) >> 8;
+                const b = (((px >> 16) & 0xFF) * decayI) >> 8;
+                pix32[j] = r | (g << 8) | (b << 16) | 0xFF000000;
+            }
+        }
+    }
+
+    const dt = activeDt;
+    const BASE_STEPS = 3; // [opt 5] reduced from 5
+    const fnA = recipeA.attractor.def.fn;
+    const fnB = recipeB.attractor.def.fn;
+    const paramsA = recipeA.attractor.params;
+    const paramsB = recipeB.attractor.params;
+    const isMorphing = morphing;
+    const mT = morphT, oneMinusMT = 1 - mT;
+
+    const noiseDefB = recipeB.noise.def;
+    const nFreqB = recipeB.noise.frequency;
+    const rgbMaxOff = recipeB.rgbDelay.maxOffset;
+    const speedNormDiv = dt > 0.01 ? 5 : 300;
+
+    let dyingCount = 0;
+
+    for (let i = 0; i < NUM; i++) {
+        life[i] += elapsed;
+
+        if ((i & 63) === (fpsFrames & 63)) {
+            const lived = life[i] / maxLife[i];
+            if (lived > 0.25 && lived < 0.95) {
+                maxLife[i] += (((i * 7 + fpsFrames * 13) & 255) / 255 - 0.45) * elapsed;
+                if (maxLife[i] < life[i] + 0.1) maxLife[i] = life[i] + 0.1;
+            }
+        }
+
+        if (life[i] >= maxLife[i]) {
+            spawnParticle(i, recipeB);
+            const warmup = 20 + ((i * 3) & 31);
+            for (let w = 0; w < warmup; w++) {
+                fnB(ppx[i], ppy[i], ppz[i], paramsB);
+                ppx[i] += _out[0]*dt; ppy[i] += _out[1]*dt; ppz[i] += _out[2]*dt;
+                if (ppx[i] !== ppx[i] || Math.abs(ppx[i]) > 200) {
+                    recipeB.attractor.def.spawn();
+                    ppx[i] = _out[0]; ppy[i] = _out[1]; ppz[i] = _out[2];
+                }
+            }
+            life[i] = 0.1;
+        }
+
+        const lf = life[i] / maxLife[i];
+        let al;
+        if (lf < 0.06) al = lf / 0.06;
+        else if (lf > 0.7) al = 1 - (lf - 0.7) / 0.3;
+        else al = 1;
+        if (al < 0.02) continue;
+
+        const dying = lf > 0.7;
+
+        // --- [opt 4+5] Morph-aware sub-stepping ---
+        // During morph: every 3rd particle gets full steps, others get 1
+        const steps = isMorphing ? ((i % 3 === 0) ? BASE_STEPS : 1) : BASE_STEPS;
+
+        // Integrate
+        let dx, dy, dz;
+        if (isMorphing) {
+            fnA(ppx[i],ppy[i],ppz[i],paramsA); _dA[0]=_out[0];_dA[1]=_out[1];_dA[2]=_out[2];
+            fnB(ppx[i],ppy[i],ppz[i],paramsB); _dB[0]=_out[0];_dB[1]=_out[1];_dB[2]=_out[2];
+            for (let s = 0; s < steps; s++) {
+                dx=_dA[0]*oneMinusMT+_dB[0]*mT; dy=_dA[1]*oneMinusMT+_dB[1]*mT; dz=_dA[2]*oneMinusMT+_dB[2]*mT;
+                ppx[i]+=dx*dt; ppy[i]+=dy*dt; ppz[i]+=dz*dt;
+                if (s<steps-1) {
+                    fnA(ppx[i],ppy[i],ppz[i],paramsA); _dA[0]=_out[0];_dA[1]=_out[1];_dA[2]=_out[2];
+                    fnB(ppx[i],ppy[i],ppz[i],paramsB); _dB[0]=_out[0];_dB[1]=_out[1];_dB[2]=_out[2];
+                }
+            }
+        } else {
+            for (let s = 0; s < steps; s++) {
+                fnB(ppx[i],ppy[i],ppz[i],paramsB);
+                dx=_out[0]; dy=_out[1]; dz=_out[2];
+                ppx[i]+=dx*dt; ppy[i]+=dy*dt; ppz[i]+=dz*dt;
+            }
+        }
+
+        const speed = Math.sqrt(dx*dx+dy*dy+dz*dz);
+
+        if (ppx[i]!==ppx[i]||Math.abs(ppx[i])>200||Math.abs(ppy[i])>200||Math.abs(ppz[i])>200) {
+            spawnParticle(i, recipeB); continue;
+        }
+
+        // --- Mouse noise deformation (in 3D, before camera) ---
+        let rx = ppx[i], ry = ppy[i], rz = ppz[i];
+
+        if (doMouse) {
+            const mdx = rx - mouse3X;
+            const mdy = ry - mouse3Y;
+            const mdz = rz - mouse3Z;
+            const mDist2 = mdx*mdx + mdy*mdy + mdz*mdz;
+
+            if (mDist2 < mouseR2) {
+                const mDist = Math.sqrt(mDist2);
+                const falloff = Math.pow(1 - mDist / mouseR, md.falloff);
+                const inf = falloff * mouseInfluence;
+                const velInf = 0.08 + velNorm * 0.92;
+                const lx = rx - mouse3X;
+                const ly = ry - mouse3Y;
+                const lz = rz - mouse3Z;
+                const origRx = rx, origRy = ry, origRz = rz;
+
+                if (md.noiseActive) {
+                    const nf = md.noiseFreq;
+                    const nt = time * md.noiseSpeed;
+                    const ns = md.noiseStrength * inf * velInf;
+                    let dnx = simplex3(rx*nf + nt, ry*nf, rz*nf);
+                    let dny = simplex3(ry*nf + 7.1, rz*nf + nt, rx*nf);
+                    let dnz = simplex3(rz*nf + 13.3, rx*nf, ry*nf + nt);
+                    if (md.noiseOctaves >= 2) {
+                        const nf2 = nf * 2.1;
+                        dnx = dnx*0.7 + simplex3(rx*nf2+nt, ry*nf2, rz*nf2)*0.3;
+                        dny = dny*0.7 + simplex3(ry*nf2+7, rz*nf2+nt, rx*nf2)*0.3;
+                        dnz = dnz*0.7 + simplex3(rz*nf2+13, rx*nf2, ry*nf2+nt)*0.3;
+                    }
+                    rx += dnx * ns;
+                    ry += dny * ns;
+                    rz += dnz * ns;
+                }
+
+                if (md.rotateActive) {
+                    const angle = md.rotateAngleMax * inf * velInf * Math.sin(time * md.rotateSpeed);
+                    const ca = Math.cos(angle), sa = Math.sin(angle);
+                    const ax = md.rotateAxis[0], ay = md.rotateAxis[1], az = md.rotateAxis[2];
+                    const dot = lx*ax + ly*ay + lz*az;
+                    const ccx = ly*az - lz*ay, ccy = lz*ax - lx*az, ccz = lx*ay - ly*ax;
+                    rx = mouse3X + lx*ca + ccx*sa + ax*dot*(1-ca);
+                    ry = mouse3Y + ly*ca + ccy*sa + ay*dot*(1-ca);
+                    rz = mouse3Z + lz*ca + ccz*sa + az*dot*(1-ca);
+                }
+
+                const maxDisp = md.noiseStrength * 1.5;
+                const dispX = rx - origRx, dispY = ry - origRy, dispZ = rz - origRz;
+                const dispLen = Math.sqrt(dispX*dispX + dispY*dispY + dispZ*dispZ);
+                if (dispLen > maxDisp) {
+                    const clamp = maxDisp / dispLen;
+                    rx = origRx + dispX * clamp;
+                    ry = origRy + dispY * clamp;
+                    rz = origRz + dispZ * clamp;
+                }
+
+                if (md.scaleActive) {
+                    const pulse = Math.sin(time * md.scalePulseSpeed) * 0.5 + 0.5;
+                    const s = md.scaleMin + (md.scaleMax - md.scaleMin) * pulse;
+                    const si = 1 + (s - 1) * inf * velInf;
+                    rx = mouse3X + (rx - mouse3X) * si;
+                    ry = mouse3Y + (ry - mouse3Y) * si;
+                    rz = mouse3Z + (rz - mouse3Z) * si;
+                }
+            }
+        }
+
+        // Noise cache — [opt 3] adaptive interval
+        noiseTick[i]++;
+        if (noiseTick[i] >= noiseCacheInterval) {
+            noiseTick[i] = 0;
+            noiseCache[i] = dying
+                ? noiseDefB.fn(ppx[i]*0.1,ppy[i]*0.1,ppz[i]*0.1,recipeB.noise.octaves,nFreqB,time)
+                : noiseDefB.fnFast(ppx[i]*0.1,ppy[i]*0.1,ppz[i]*0.1,nFreqB,time);
+        }
+        const noiseBright = 0.3 + Math.abs(noiseCache[i]) * 0.7;
+
+        // Camera transform (on deformed position)
+        const crx1 = rx*ccY - rz*scY;
+        const crz1 = rx*scY + rz*ccY;
+        const cry1 = ry*ccX - crz1*scX;
+        const crz2 = ry*scX + crz1*ccX;
+        const scale = camD / (camD + crz2);
+        const sx = cx + crx1*scale*screenScale;
+        const sy = cy - cry1*scale*screenScale;
+
+        if (sx < 3 || sx >= W-4 || sy < 3 || sy >= H-4) continue;
+
+        const depthFade = Math.max(0.08, 1 - crz2 * 0.03);
+        al *= depthFade * noiseBright;
+
+        const speedNorm = Math.min(speed / speedNormDiv, 1);
+        const colorT = Math.max(0, Math.min(1, speedNorm*0.6+noiseCache[i]*0.2+0.3));
+        const col = samplePalette(activePalette, colorT);
+
+        if (dying) {
+            dyingCount++;
+            const dyingT = (lf - 0.7) / 0.3;
+            const maxOff = rgbMaxOff * dyingT * dyingT;
+            // [opt 7] Cheap hash-based normals (replaces 3x simplex3)
+            const hx = (sx * 7 + time * 100) | 0;
+            const hy = (sy * 13 + time * 71) | 0;
+            const nGx = hash2d(hx, hy);
+            const nGy = hash2d(hx + 1, hy + 1);
+            const nLen = 1 / (Math.sqrt(nGx*nGx + nGy*nGy) + 0.001);
+            const normX = nGx * nLen, normY = nGy * nLen;
+            const r=(col[0]*al)|0, g=(col[1]*al)|0, b=(col[2]*al)|0;
+            splatSub(sx+normX*maxOff, sy+normY*maxOff, r, 0, 0);
+            splatSub(sx, sy, 0, g, 0);
+            splatSub(sx-normX*maxOff*0.65, sy-normY*maxOff*0.65, 0, 0, b);
+        } else {
+            splatFast(sx, sy, (col[0]*al)|0, (col[1]*al)|0, (col[2]*al)|0);
+        }
+    }
+
+    prevPix32.set(pix32); // [opt 1] Uint32 copy (faster than byte-level set)
+
+    // ============================================
+    //  Ripple glass cursor — fake refraction post-effect
+    // ============================================
+    if (mouseInfluence > 0.02) {
+        const RIPPLE_R = 60;
+        const mx = (mouseX + 0.5) | 0;
+        const my = (mouseY + 0.5) | 0;
+
+        const x0 = Math.max(RIPPLE_R, Math.min(W - RIPPLE_R - 1, mx));
+        const y0 = Math.max(RIPPLE_R, Math.min(H - RIPPLE_R - 1, my));
+
+        const rippleTime = time * 3;
+        const velRipple = 0.3 + velNorm * 0.7;
+        const rippleStr = 8 * mouseInfluence * velRipple;
+
+        const iStart = Math.max(0, y0 - RIPPLE_R);
+        const iEnd = Math.min(H - 1, y0 + RIPPLE_R);
+        const jStart = Math.max(0, x0 - RIPPLE_R);
+        const jEnd = Math.min(W - 1, x0 + RIPPLE_R);
+
+        // [opt 2] Mark ripple tiles dirty
+        const tileX0 = jStart >> TILE_SHIFT, tileX1 = jEnd >> TILE_SHIFT;
+        const tileY0 = iStart >> TILE_SHIFT, tileY1 = iEnd >> TILE_SHIFT;
+        for (let ty = tileY0; ty <= tileY1; ty++)
+            for (let tx = tileX0; tx <= tileX1; tx++)
+                tileLife[ty * TILES_X + tx] = TILE_PERSIST;
+
+        for (let iy = iStart; iy <= iEnd; iy++) {
+            const dy = iy - y0;
+            for (let ix = jStart; ix <= jEnd; ix++) {
+                const dx = ix - x0;
+                const dist2 = dx * dx + dy * dy;
+                const r2 = RIPPLE_R * RIPPLE_R;
+                if (dist2 >= r2) continue;
+
+                const dist = Math.sqrt(dist2);
+                const t = dist / RIPPLE_R;
+
+                const ripple = Math.sin(dist * 0.5 - rippleTime) * (1 - t * t);
+                const ripple2 = Math.sin(dist * 0.9 + rippleTime * 1.7) * (1 - t) * 0.4;
+                const totalRipple = (ripple + ripple2) * rippleStr;
+
+                const invDist = dist > 0.5 ? 1 / dist : 0;
+                const rdx = dx * invDist;
+                const rdy = dy * invDist;
+
+                const offX = rdx * totalRipple;
+                const offY = rdy * totalRipple;
+                const chromStr = totalRipple * 0.15;
+
+                const rsx = Math.max(0, Math.min(W-1, (ix + offX + rdx * chromStr + 0.5) | 0));
+                const rsy = Math.max(0, Math.min(H-1, (iy + offY + rdy * chromStr + 0.5) | 0));
+                const gsx = Math.max(0, Math.min(W-1, (ix + offX + 0.5) | 0));
+                const gsy = Math.max(0, Math.min(H-1, (iy + offY + 0.5) | 0));
+                const bsx = Math.max(0, Math.min(W-1, (ix + offX - rdx * chromStr + 0.5) | 0));
+                const bsy = Math.max(0, Math.min(H-1, (iy + offY - rdy * chromStr + 0.5) | 0));
+
+                const dstIdx = (iy * W + ix) << 2;
+                const rIdx = (rsy * W + rsx) << 2;
+                const gIdx = (gsy * W + gsx) << 2;
+                const bIdx = (bsy * W + bsx) << 2;
+
+                const edgeGlow = t > 0.85 ? (t - 0.85) / 0.15 * 12 * mouseInfluence : 0;
+
+                pix[dstIdx]     = Math.min(255, prevPix[rIdx]     + edgeGlow);
+                pix[dstIdx + 1] = Math.min(255, prevPix[gIdx + 1] + edgeGlow);
+                pix[dstIdx + 2] = Math.min(255, prevPix[bIdx + 2] + edgeGlow);
+            }
+        }
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+
+    // HUD
+    const rB = recipeB;
+    const palColors = activePalette.anchors.map(c => {
+        const hex = '#' + c.map(v => (Math.max(0,Math.min(255,v|0)).toString(16)).padStart(2,'0')).join('');
+        return `<span style="color:${hex}">\u2588</span>`;
+    }).join('');
+
+    let morphStr = '';
+    if (morphing) morphStr = `<br><span style="color:#FFD080">morphing</span> ${recipeA.attractor.def.name} \u2192 ${rB.attractor.def.name} ${(mT*100)|0}%`;
+
+    const deformStr = mouseInfluence > 0.05
+        ? `<br><span style="color:#80FFB0">deform</span> ${md.type} r=${mouseR.toFixed(1)}` +
+          ` <span style="color:#A0D0A0">vel ${(velNorm*100)|0}%</span>`
+        : '';
+
+    // Count active tiles for HUD
+    let activeTiles = 0;
+    for (let ti = 0; ti < tileLife.length; ti++) if (tileLife[ti] > 0) activeTiles++;
+
+    hudEl.innerHTML =
+        `<b>${rB.attractor.def.name}</b>  |  ${rB.noise.def.name} noise  |  ${fpsDisplay} fps<br>` +
+        `${NUM} particles  |  ${dyingCount} RGB split  |  decay ${activeDecay.toFixed(2)}<br>` +
+        `palette: ${palColors} ${activePalette.strategy}` +
+        `<br><span style="color:rgba(255,255,255,0.15)">steps: ${BASE_STEPS}${isMorphing ? ' (tiered)' : ''} | noise: ${noiseCacheInterval}f | tiles: ${activeTiles}/${tileLife.length}</span>` +
+        morphStr + deformStr +
+        `<br><span style="color:rgba(255,255,255,0.2)">click to morph  \u2022  hover to deform (re-rolls each entry)</span>`;
+
+    requestAnimationFrame(animate);
+}
+
+lastFrame = performance.now();
+initFirstRecipe();
+requestAnimationFrame(animate);
+
+</script>
+</body>
+</html>
