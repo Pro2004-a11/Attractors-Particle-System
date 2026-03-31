@@ -13,11 +13,11 @@ A real-time, browser-based generative art engine that simulates and visualizes c
 [cite_start]The **Attractor Engine** is designed to handle tens of thousands of particles moving through non-linear dynamical systems[cite: 2]. It features seamless "morphing" between different mathematical recipes, interactive mouse-driven spatial deformation, and a post-processing pipeline for RGB splitting effects.
 
 ### Key Mathematical Models
-[cite_start]The engine includes a library of classic and complex attractors[cite: 2]:
-* [cite_start]**Lorenz & Rössler:** The foundations of chaos theory[cite: 2].
-* [cite_start]**Aizawa & Dadras:** Complex, spherical, and organic structures[cite: 2].
-* [cite_start]**Chen, Halvorsen, & Thomas:** Highly symmetric and multi-wing systems[cite: 2].
-* [cite_start]**Sprott B & Four-Wing:** Minimalist yet unpredictable flow[cite: 2].
+The engine includes a library of classic and complex attractors[cite: 2]:
+* **Lorenz & Rössler:** The foundations of chaos theory[cite: 2].
+* **Aizawa & Dadras:** Complex, spherical, and organic structures[cite: 2].
+* **Chen, Halvorsen, & Thomas:** Highly symmetric and multi-wing systems[cite: 2].
+* **Sprott B & Four-Wing:** Minimalist yet unpredictable flow[cite: 2].
 
 ---
 
