@@ -60,3 +60,7 @@ The core engine runs directly in the browser via `engine.html`. [cite_start]For 
 
 3.  **Run the Engine:**
     Open `engine.html` in a modern web browser (optimized for Windows 11 environments).
+
+---
+
+<sub>🤖 Developed with assistance from [Claude Code](https://claude.com/claude-code).</sub>
